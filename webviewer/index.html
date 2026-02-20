@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GGGS Gaussian Splatting Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: #000;
+    color: #ddd;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    overflow: hidden;
+}
+
+#viewer-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+}
+
+#ui-panel {
+    position: fixed;
+    top: 12px; left: 12px;
+    background: rgba(20, 20, 30, 0.85);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    max-width: 280px;
+    backdrop-filter: blur(8px);
+    z-index: 10;
+}
+
+#ui-panel h2 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: #7eb8ff;
+    letter-spacing: 0.5px;
+}
+
+.row {
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.row label {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: #999;
+}
+
+input[type="file"] { display: none; }
+
+.btn {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #ccc;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+.btn:hover { background: rgba(255,255,255,0.15); }
+
+select {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #ccc;
+    padding: 4px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: inherit;
+}
+
+#status {
+    font-size: 11px;
+    color: #aaa;
+    margin-top: 8px;
+    word-break: break-all;
+}
+
+#fps {
+    position: fixed;
+    top: 12px; right: 12px;
+    background: rgba(20, 20, 30, 0.85);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #7ef47e;
+    z-index: 10;
+    backdrop-filter: blur(8px);
+}
+
+#cameras-panel {
+    display: none;
+    position: fixed;
+    bottom: 12px; left: 12px;
+    background: rgba(20, 20, 30, 0.85);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    max-width: 320px;
+    max-height: 280px;
+    overflow-y: auto;
+    z-index: 10;
+    backdrop-filter: blur(8px);
+}
+
+.cam-nav-btn {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #ccc;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    transition: background 0.15s;
+    line-height: 1.2;
+}
+.cam-nav-btn:hover { background: rgba(255,255,255,0.15); }
+
+.cam-btn-active {
+    background: rgba(126, 184, 255, 0.25) !important;
+    color: #7eb8ff !important;
+    border-color: rgba(126, 184, 255, 0.4) !important;
+}
+
+#cameras-panel h3 {
+    font-size: 12px;
+    color: #999;
+    margin-bottom: 6px;
+}
+
+#camera-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.cam-btn {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: #aaa;
+    padding: 3px 7px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+.cam-btn:hover {
+    background: rgba(126, 184, 255, 0.2);
+    color: #7eb8ff;
+}
+
+.hint {
+    font-size: 11px;
+    color: #666;
+    margin-top: 6px;
+}
+
+/* Segment panel */
+#seg-panel {
+    display: none;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+}
+#seg-panel h3 {
+    font-size: 12px;
+    color: #7eb8ff;
+    margin-bottom: 6px;
+}
+.seg-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 3px;
+    font-size: 12px;
+}
+.seg-row input[type="checkbox"] {
+    margin: 0;
+    accent-color: #7eb8ff;
+}
+.seg-row label {
+    color: #bbb;
+    cursor: pointer;
+}
+.seg-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid rgba(255,255,255,0.2);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<canvas id="viewer-canvas"></canvas>
+
+<div id="ui-panel">
+    <h2>GGGS Viewer</h2>
+
+    <div class="row">
+        <label>Model:</label>
+        <select id="model-select" style="flex:1; max-width:160px;">
+            <option value="">-- Select --</option>
+        </select>
+    </div>
+
+    <div class="row" id="iter-row" style="display:none">
+        <label>Iter:</label>
+        <select id="iter-select" style="flex:1; max-width:120px;"></select>
+        <button class="btn" id="load-btn">Load</button>
+    </div>
+
+    <div class="row" style="margin-top:4px; border-top:1px solid rgba(255,255,255,0.06); padding-top:8px;">
+        <label>File:</label>
+        <label class="btn" for="file-input">Upload PLY/.splat</label>
+        <input type="file" id="file-input" accept=".ply,.splat">
+    </div>
+
+    <div class="row">
+        <label>Cameras:</label>
+        <label class="btn" for="cameras-input">Upload cameras.json</label>
+        <input type="file" id="cameras-input" accept=".json">
+    </div>
+
+    <div class="row">
+        <label>SH Degree:</label>
+        <select id="sh-degree">
+            <option value="0">SH 0 (DC only)</option>
+        </select>
+    </div>
+
+    <div class="row">
+        <button class="btn" id="bg-toggle">BG: Black</button>
+        <button class="btn" id="ref-toggle">Show Ref</button>
+    </div>
+
+    <div class="row">
+        <label>Mip Filter:</label>
+        <input type="range" id="mip-filter" min="0" max="3" step="0.1" value="0" style="flex:1">
+        <span id="mip-filter-val" style="font-size:11px;color:#aaa;min-width:28px">0.0</span>
+    </div>
+
+    <div id="seg-panel">
+        <h3>Segments</h3>
+        <div class="row">
+            <label>Mode:</label>
+            <select id="seg-mode">
+                <option value="0">Off</option>
+                <option value="1">Category Color</option>
+                <option value="2">Instance Color</option>
+            </select>
+        </div>
+        <div id="seg-categories"></div>
+    </div>
+
+    <div id="status">Drag & drop a .ply or .splat file to begin</div>
+    <div class="hint">LMB: orbit &middot; RMB: pan &middot; Scroll: zoom</div>
+</div>
+
+<div id="fps">-- FPS</div>
+
+<img id="ref-overlay" src="" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; object-fit:contain; z-index:5; pointer-events:none;">
+
+<div id="cameras-panel">
+    <h3>Camera Viewpoints</h3>
+    <div id="cam-nav" style="display:none">
+        <div class="row" style="margin-bottom:6px">
+            <button class="cam-nav-btn" id="cam-prev" title="Previous (←)">&#9664;</button>
+            <span id="cam-index" style="color:#aaa;font-size:11px;min-width:50px;text-align:center">0 / 0</span>
+            <button class="cam-nav-btn" id="cam-next" title="Next (→)">&#9654;</button>
+            <span style="flex:1"></span>
+            <button class="cam-nav-btn" id="cam-play" title="Play/Pause (Space)">&#9654; Play</button>
+            <button class="cam-nav-btn" id="cam-loop" title="Toggle Loop" style="color:#7eb8ff">&#8635;</button>
+        </div>
+        <div class="row" style="margin-bottom:6px">
+            <label style="font-size:11px;color:#888">Speed:</label>
+            <input type="range" id="cam-speed" min="0.1" max="3" step="0.1" value="0.5" style="flex:1">
+            <span id="cam-speed-val" style="font-size:11px;color:#aaa;min-width:32px">0.5x</span>
+        </div>
+        <div id="cam-progress-wrap" style="height:4px;background:rgba(255,255,255,0.08);border-radius:2px;cursor:pointer;margin-bottom:6px">
+            <div id="cam-progress-bar" style="height:100%;width:0;background:#7eb8ff;border-radius:2px;transition:width 0.05s"></div>
+        </div>
+    </div>
+    <div id="camera-list"></div>
+</div>
+
+<script type="module" src="viewer.js"></script>
+</body>
+</html>

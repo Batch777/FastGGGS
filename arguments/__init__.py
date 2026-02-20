@@ -117,6 +117,28 @@ class OptimizationParams(ParamGroup):
         self.multi_view_pixel_noise_th = 1.0
         self.use_geo_occ_aware = True
 
+        # Instance segmentation (Trace3D) parameters
+        self.use_instance_seg = False
+        self.instance_seg_from_iter = 7000
+        self.instance_update_interval = 500
+        self.lambda_seg = 0.1
+        self.lambda_depth_edge = 0.05
+        self.tau_split_instance = 0.5
+        self.tau_prune_instance = 0.1
+        self.tau_affinity = 0.3
+        self.seg_loss_mode = "ce"
+        self.instance_mask_dir = "masks"
+
+        # FastGS parameters
+        self.use_fastgs = False
+        self.loss_thresh = 0.1
+        self.grad_thresh = 0.0002
+        self.grad_abs_thresh = 0.0012
+        self.dense = 0.001
+        self.highfeature_lr = 0.005
+        self.lowfeature_lr = 0.0025
+        self.mult = 0.5
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

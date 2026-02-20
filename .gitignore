@@ -31,3 +31,13 @@ CMakeCache.txt
 cmake.check_cache
 blender_scripts/
 .clangd
+
+# Data & model weights (large files)
+data/
+*.pt
+*.pth
+*.ckpt
+submodules/sam3
+submodules/sam3/
+submodules/LangSplatV2
+submodules/LangSplatV2/

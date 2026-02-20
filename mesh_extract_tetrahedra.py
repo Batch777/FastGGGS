@@ -184,7 +184,7 @@ def marching_tetrahedra_with_binary_search(model_path, views, gaussians, pipelin
 def extract_mesh(dataset: ModelParams, iteration: int, pipeline: PipelineParams, move_cpu: bool, num_cluster: int):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, load_images=False)
         kernel_size = dataset.kernel_size
 
         cams = scene.getTrainCameras()

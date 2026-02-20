@@ -40,6 +40,7 @@ void preprocess(
     const float focal_x, const float focal_y,
     const float tan_fovx, const float tan_fovy,
     const float kernel_size,
+    const float mult,
     int* radii,
     bool* clamped,
     float2* means2D,
@@ -74,7 +75,10 @@ void render(
     float* out_normal,
     float* out_mdepth,
     float* normal_length,
-    bool require_depth);
+    bool require_depth,
+    bool get_flag = false,
+    const int* metric_map = nullptr,
+    int* metricCount = nullptr);
 } // namespace FORWARD
 
 #endif

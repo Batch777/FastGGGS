@@ -36,7 +36,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
     const torch::Tensor& background,
     const torch::Tensor& means3D,
@@ -62,7 +62,10 @@ RasterizeGaussiansCUDA(
     const torch::Tensor& campos,
     const bool prefiltered,
     const bool require_depth,
-    const bool debug) {
+    const bool debug,
+    const bool get_flag,
+    const torch::Tensor& metric_map,
+    const float mult) {
     if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
         AT_ERROR("means3D must have dimensions (num_points, 3)");
     }
@@ -79,6 +82,16 @@ RasterizeGaussiansCUDA(
     torch::Tensor out_alpha  = torch::full({1, H, W}, 0.0, float_opts);
     torch::Tensor out_normal = torch::full({3, H, W}, 0.0, float_opts);
     torch::Tensor radii      = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+
+    // FastGS metric accumulation
+    torch::Tensor metricCount = torch::empty({0}, int_opts);
+    int* accum_metric_counts_ptr = nullptr;
+    const int* metric_map_ptr = nullptr;
+    if (get_flag) {
+        metricCount = torch::full({P}, 0, int_opts);
+        accum_metric_counts_ptr = metricCount.contiguous().data_ptr<int>();
+        metric_map_ptr = metric_map.contiguous().data_ptr<int>();
+    }
 
     torch::Device device(torch::kCUDA);
     torch::TensorOptions options(torch::kByte);
@@ -133,9 +146,13 @@ RasterizeGaussiansCUDA(
             out_normal.contiguous().data_ptr<float>(),
             radii.contiguous().data_ptr<int>(),
             require_depth,
-            debug);
+            debug,
+            get_flag,
+            metric_map_ptr,
+            accum_metric_counts_ptr,
+            mult);
     }
-    return std::make_tuple(rendered, out_color, out_alpha, out_normal, out_mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer);
+    return std::make_tuple(rendered, out_color, out_alpha, out_normal, out_mdepth, radii, geomBuffer, binningBuffer, imgBuffer, tileBuffer, metricCount);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

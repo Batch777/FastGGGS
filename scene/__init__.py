@@ -11,8 +11,10 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Sequence, Union
 
+import cv2
 import numpy as np
 import torch
 
@@ -28,7 +30,7 @@ class Scene:
 
     gaussians: GaussianModel
 
-    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_images=True):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -74,10 +76,10 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, load_images=load_images)
             print(f"Loading Training Cameras: {len(self.train_cameras[resolution_scale])} .")
 
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, load_images=load_images)
             print(f"Loading Test Cameras: {len(self.test_cameras[resolution_scale])} .")
 
             print("computing nearest_id")
@@ -116,6 +118,43 @@ class Scene:
                         json_str = json.dumps(json_d, separators=(",", ":"))
                         file.write(json_str)
                         file.write("\n")
+
+        # Load instance segmentation masks if enabled
+        instance_mask_dir = getattr(args, "instance_mask_dir", "masks")
+        use_instance_seg = getattr(args, "use_instance_seg", False)
+        if use_instance_seg:
+            mask_dir = os.path.join(args.source_path, instance_mask_dir)
+            if os.path.isdir(mask_dir):
+                mask_files = {Path(f).stem: os.path.join(mask_dir, f)
+                              for f in os.listdir(mask_dir)
+                              if f.endswith((".png", ".npy"))}
+                n_loaded = 0
+                for resolution_scale in resolution_scales:
+                    for cam in self.train_cameras[resolution_scale]:
+                        mpath = mask_files.get(cam.image_name)
+                        if mpath is not None:
+                            if mpath.endswith(".npy"):
+                                raw = np.load(mpath)
+                            else:
+                                raw = cv2.imread(mpath, cv2.IMREAD_UNCHANGED)
+                                if raw is None:
+                                    continue
+                                if raw.ndim == 3:
+                                    raw = raw[:, :, 0]
+                            # Resize to camera resolution (nearest neighbor)
+                            H, W = cam.image_height, cam.image_width
+                            if raw.shape[0] != H or raw.shape[1] != W:
+                                raw = cv2.resize(raw, (W, H), interpolation=cv2.INTER_NEAREST)
+                            cam.instance_mask = torch.tensor(raw.astype(np.int64), dtype=torch.long, device="cuda")
+                            n_loaded += 1
+                        else:
+                            cam.instance_mask = torch.zeros(cam.image_height, cam.image_width, dtype=torch.long, device="cuda")
+                print(f"Instance masks loaded: {n_loaded}/{sum(len(self.train_cameras[s]) for s in resolution_scales)} cameras")
+            else:
+                print(f"Warning: instance_mask_dir '{mask_dir}' not found, all masks default to 0")
+                for resolution_scale in resolution_scales:
+                    for cam in self.train_cameras[resolution_scale]:
+                        cam.instance_mask = torch.zeros(cam.image_height, cam.image_width, dtype=torch.long, device="cuda")
 
         self.gaussians.create_app_model(len(scene_info.train_cameras), args.use_decoupled_appearance)
 

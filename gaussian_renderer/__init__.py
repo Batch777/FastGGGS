@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size, scaling_modifier = 1.0, require_depth : bool = True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size, scaling_modifier = 1.0, require_depth : bool = True, mult : float = 0.5):
     """
     Render the scene. 
     
@@ -46,7 +46,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         require_depth = require_depth,
-        debug=pipe.debug
+        debug=pipe.debug,
+        mult=mult,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -71,7 +72,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     sg_sharpness = pc.get_sg_sharpness
     sg_color = pc.get_sg_color
 
-    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal = rasterizer(
+    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal, accum_metric_counts = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -95,7 +96,68 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "normal":rendered_normal,
+            "accum_metric_counts": accum_metric_counts,
             }
+
+
+def render_for_metric(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, kernel_size, get_flag=False, metric_map=None, mult: float = 0.5):
+    """Render with optional FastGS metric accumulation (no grad, no depth)."""
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, device="cuda")
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        bg=bg_color,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        sg_degree=pc.active_sg_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        require_depth=False,
+        debug=False,
+        get_flag=get_flag,
+        metric_map=metric_map,
+        mult=mult,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    scales, opacity = pc.get_scaling_n_opacity_with_3D_filter
+    rotations = pc.get_rotation
+    shs = pc.get_features
+    sg_axis = pc.get_sg_axis
+    sg_sharpness = pc.get_sg_sharpness
+    sg_color = pc.get_sg_color
+
+    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal, accum_metric_counts = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs,
+        sg_axis=sg_axis,
+        sg_sharpness=sg_sharpness,
+        sg_color=sg_color,
+        colors_precomp=None,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=None,
+    )
+
+    return {
+        "render": rendered_image,
+        "accum_metric_counts": accum_metric_counts,
+    }
+
 
 # integration is adopted from GOF for marching tetrahedra https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/gaussian_renderer/__init__.py
 def integrate(points3D, viewpoint_camera, pc : GaussianModel, pipe, kernel_size : float, scaling_modifier = 1.0):

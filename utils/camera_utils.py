@@ -3,26 +3,31 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
+import torch
+from PIL import Image
+
+from scene.cameras import Camera
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-import torch
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
-
+def _compute_resolution(args, cam_info, resolution_scale):
+    orig_w, orig_h = cam_info.width, cam_info.height
     if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
+        return round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    else:
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
@@ -35,33 +40,97 @@ def loadCam(args, id, cam_info, resolution_scale):
                 global_down = 1
         else:
             global_down = orig_w / args.resolution
-
         scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale))
+        return (int(orig_w / scale), int(orig_h / scale))
 
-    if len(cam_info.image.split()) > 3:
-        resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
-        loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
-        gt_image = resized_image_rgb
+def _load_image(cam_info, resolution):
+    """Load and resize image to target resolution (CPU-only, thread-safe)."""
+    if cam_info.image is None:
+        image = Image.open(cam_info.image_path)
+        if cam_info.image_path.lower().endswith(('.jpg', '.jpeg')):
+            image.draft('RGB', resolution)
+        image = image.resize(resolution)
+        image = image.convert('RGB')
+        resized_image = torch.from_numpy(np.array(image)) / 255.0
+        if len(resized_image.shape) == 3:
+            gt_image = resized_image.permute(2, 0, 1)
+        else:
+            gt_image = resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        return gt_image, None
     else:
-        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-        loaded_mask = None
-        gt_image = resized_image_rgb
+        if len(cam_info.image.split()) > 3:
+            gt_image = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
+            loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
+            return gt_image, loaded_mask
+        else:
+            return PILtoTorch(cam_info.image, resolution), None
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+def loadCam(args, id, cam_info, resolution_scale):
+    resolution = _compute_resolution(args, cam_info, resolution_scale)
+    gt_image, loaded_mask = _load_image(cam_info, resolution)
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
-    camera_list = []
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, load_images=True):
+    total = len(cam_infos)
+    if total == 0:
+        return []
 
+    resolutions = [_compute_resolution(args, c, resolution_scale) for c in cam_infos]
+
+    if not load_images:
+        # Lightweight mode: skip image I/O, reuse a single zero tensor per resolution
+        import math
+        camera_list = []
+        res_cache = {}
+        for id, c in enumerate(cam_infos):
+            w, h = resolutions[id]
+            if (w, h) not in res_cache:
+                res_cache[(w, h)] = torch.zeros(3, h, w)
+            dummy = res_cache[(w, h)]
+            cam = Camera(colmap_id=c.uid, R=c.R, T=c.T,
+                         FoVx=c.FovX, FoVy=c.FovY,
+                         image=dummy, gt_alpha_mask=None,
+                         image_name=c.image_name, uid=id, data_device=args.data_device)
+            cam.original_image = None
+            cam.gray_image = None
+            camera_list.append(cam)
+        sys.stdout.write(f'Created {total} cameras (no image loading)\n')
+        return camera_list
+
+    num_workers = min(8, total)
+
+    # Phase 1: multithread image I/O + decode + resize (CPU-only, no CUDA)
+    image_data = [None] * total
+
+    def _load_one(idx):
+        return idx, _load_image(cam_infos[idx], resolutions[idx])
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_load_one, i) for i in range(total)]
+        for done_count, future in enumerate(as_completed(futures), 1):
+            idx, data = future.result()
+            image_data[idx] = data
+            sys.stdout.write(f'\rLoading images {done_count}/{total}')
+            sys.stdout.flush()
+    sys.stdout.write('\n')
+
+    # Phase 2: create Camera objects sequentially (CUDA ops)
+    camera_list = []
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        gt_image, loaded_mask = image_data[id]
+        cam = Camera(colmap_id=c.uid, R=c.R, T=c.T,
+                     FoVx=c.FovX, FoVy=c.FovY,
+                     image=gt_image, gt_alpha_mask=loaded_mask,
+                     image_name=c.image_name, uid=id, data_device=args.data_device)
+        camera_list.append(cam)
+    image_data.clear()
 
     return camera_list
 
-def camera_to_JSON(id, camera : Camera):
+def camera_to_JSON(id, camera):
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T

@@ -301,6 +301,7 @@ __global__ void preprocessCUDA(
     const float tan_fovx, float tan_fovy,
     const float focal_x, float focal_y,
     const float kernel_size,
+    const float mult,
     int* radii,
     bool* clamped,
     float2* points_xy_image,
@@ -362,9 +363,11 @@ __global__ void preprocessCUDA(
     float lambda2      = mid - sqrtf(fmaxf(0.1f, mid * mid - det));
     float my_radius    = ceilf(3.f * sqrtf(fmaxf(lambda1, lambda2)));
     float2 point_image = {ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H)};
-    uint2 rect_min, rect_max;
-    getRect(point_image, my_radius, rect_min, rect_max, grid);
-    if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+
+    // Compact Bounding Box (SNUGBOX): use tight ellipse-based tile counting
+    float4 con_o = {conic.x, conic.y, conic.z, opacities[idx] * ceof};
+    uint32_t tiles_count = duplicateToTilesTouched(point_image, con_o, grid, mult, 0, 0, 0, nullptr, nullptr);
+    if (tiles_count == 0)
         return;
 
     // If colors have been precomputed, use them, otherwise convert
@@ -381,8 +384,8 @@ __global__ void preprocessCUDA(
     radii[idx]           = my_radius;
     points_xy_image[idx] = point_image;
     // Inverse 2D covariance and opacity neatly pack into one float4
-    conic_opacity[idx] = {conic.x, conic.y, conic.z, opacities[idx] * ceof};
-    tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
+    conic_opacity[idx] = con_o;
+    tiles_touched[idx] = tiles_count;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -408,7 +411,10 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         float* __restrict__ out_alpha,
         float* __restrict__ out_normal,
         float* __restrict__ out_mdepth,
-        float* __restrict__ normal_length) {
+        float* __restrict__ normal_length,
+        bool get_flag,
+        const int* __restrict__ metric_map,
+        int* __restrict__ metricCount) {
     // Identify current tile and associated min/max pixel range.
     auto block                 = cg::this_thread_block();
     uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -437,6 +443,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
     [[maybe_unused]] __shared__ float4 collected_ray_planes[BLOCK_SIZE];
     [[maybe_unused]] __shared__ float3 collected_normals[BLOCK_SIZE];
+    __shared__ int collected_id[BLOCK_SIZE];
 
     // Initialize helper variables
     float T                            = 1.0f;
@@ -462,6 +469,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         int progress = i * BLOCK_SIZE + block.thread_rank();
         if (range.x + progress < range.y) {
             int coll_id                                  = point_list[range.x + progress];
+            collected_id[block.thread_rank()]            = coll_id;
             collected_xy[block.thread_rank()]            = points_xy_image[coll_id];
             collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
             for (int ch = 0; ch < CHANNELS; ch++)
@@ -505,6 +513,11 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
             // Eq. (3) from 3D Gaussian splatting paper.
             for (int ch = 0; ch < CHANNELS; ch++)
                 C[ch] += collected_feature[j + BLOCK_SIZE * ch] * aT;
+
+            // FastGS: accumulate per-Gaussian metric counts for VCD/VCP
+            if (get_flag && metric_map != nullptr && metric_map[pix_id] == 1) {
+                atomicAdd(&metricCount[collected_id[j]], 1);
+            }
 
             if constexpr (GEOMETRY) {
                 float4 ray_plane = collected_ray_planes[j];
@@ -691,13 +704,17 @@ void FORWARD::render(
     float* out_normal,
     float* out_mdepth,
     float* normal_length,
-    bool require_depth) {
+    bool require_depth,
+    bool get_flag,
+    const int* metric_map,
+    int* metricCount) {
 #define RENDER_CUDA_CALL(template_depth)                                                \
     renderCUDA<NUM_CHANNELS, template_depth, SPLIT, SPLIT_ITERATIONS><<<grid, block>>>( \
         ranges, point_list, W, H, means2D, conic_opacity, colors,                       \
         ray_planes, normals, focal_x, focal_y,                                          \
         n_contrib, max_contributor, bg_color, out_color, out_alpha,                     \
-        out_normal, out_mdepth, normal_length)
+        out_normal, out_mdepth, normal_length,                                          \
+        get_flag, metric_map, metricCount)
 
     if (require_depth)
         RENDER_CUDA_CALL(true);
@@ -727,6 +744,7 @@ void FORWARD::preprocess(
     const float focal_x, const float focal_y,
     const float tan_fovx, const float tan_fovy,
     const float kernel_size,
+    const float mult,
     int* radii,
     bool* clamped,
     float2* means2D,
@@ -759,6 +777,7 @@ void FORWARD::preprocess(
         tan_fovx, tan_fovy,
         focal_x, focal_y,
         kernel_size,
+        mult,
         radii,
         clamped,
         means2D,

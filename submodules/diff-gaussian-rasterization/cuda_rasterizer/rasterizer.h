@@ -58,7 +58,11 @@ public:
         float* out_normal,
         int* radii         = nullptr,
         bool require_depth = true,
-        bool debug         = false);
+        bool debug         = false,
+        bool get_flag      = false,
+        const int* metric_map = nullptr,
+        int* metricCount   = nullptr,
+        float mult         = 0.5f);
 
     static void backward(
         std::function<char*(size_t)> geometryBuffer,

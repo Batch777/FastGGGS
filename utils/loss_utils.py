@@ -265,3 +265,6 @@ class PatchMatch:
         else:
             ncc_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
         return ncc_loss, geo_loss
+
+
+from utils.instance_utils import instance_seg_loss_ce, instance_seg_loss_contrastive, depth_edge_loss  # noqa: E402, F401

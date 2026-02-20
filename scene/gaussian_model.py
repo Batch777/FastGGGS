@@ -84,6 +84,9 @@ class GaussianModel:
         self.setup_functions()
         self.appearance_network: Optional[AppearanceNetwork] = None
         self._appearance_embeddings: Optional[torch.nn.Parameter] = None
+        self._instance_id = torch.empty(0, dtype=torch.long)
+        self._instance_entropy = torch.empty(0)
+        self._semantic_category = torch.empty(0, dtype=torch.long)
 
     def capture(self):
         if self.app_model == self.App_model.GOF:
@@ -110,30 +113,91 @@ class GaussianModel:
             self.app_model,
             app_model_param,
             self._appearance_embeddings,
+            self._instance_id,
+            self._instance_entropy,
+            self._semantic_category,
         )
 
     def restore(self, model_args, training_args):
-        (
-            self.active_sh_degree,
-            self.active_sg_degree,
-            self._xyz,
-            self._features_dc,
-            self._features_rest,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self._sg_axis,
-            self._sg_sharpness,
-            self._sg_color,
-            self.max_radii2D,
-            xyz_gradient_accum,
-            denom,
-            opt_dict,
-            self.spatial_lr_scale,
-            self.app_model,
-            app_dict,
-            _appearance_embeddings,
-        ) = model_args
+        # Backward-compatible unpack: old checkpoints have 19 fields,
+        # 21 with _instance_id/_instance_entropy, 22 with _semantic_category.
+        if len(model_args) >= 22:
+            (
+                self.active_sh_degree,
+                self.active_sg_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._sg_axis,
+                self._sg_sharpness,
+                self._sg_color,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self.app_model,
+                app_dict,
+                _appearance_embeddings,
+                self._instance_id,
+                self._instance_entropy,
+                self._semantic_category,
+            ) = model_args
+        elif len(model_args) >= 21:
+            (
+                self.active_sh_degree,
+                self.active_sg_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._sg_axis,
+                self._sg_sharpness,
+                self._sg_color,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self.app_model,
+                app_dict,
+                _appearance_embeddings,
+                self._instance_id,
+                self._instance_entropy,
+            ) = model_args
+            N = self._xyz.shape[0]
+            self._semantic_category = torch.zeros(N, dtype=torch.long, device=self._xyz.device)
+        else:
+            (
+                self.active_sh_degree,
+                self.active_sg_degree,
+                self._xyz,
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self._sg_axis,
+                self._sg_sharpness,
+                self._sg_color,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+                self.app_model,
+                app_dict,
+                _appearance_embeddings,
+            ) = model_args
+            N = self._xyz.shape[0]
+            self._instance_id = torch.zeros(N, dtype=torch.long, device=self._xyz.device)
+            self._instance_entropy = torch.zeros(N, device=self._xyz.device)
+            self._semantic_category = torch.zeros(N, dtype=torch.long, device=self._xyz.device)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -338,6 +402,10 @@ class GaussianModel:
         self._sg_color = nn.Parameter(sg_color.requires_grad_(True))
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        N = self.get_xyz.shape[0]
+        self._instance_id = torch.zeros(N, dtype=torch.long, device="cuda")
+        self._instance_entropy = torch.zeros(N, device="cuda")
+        self._semantic_category = torch.zeros(N, dtype=torch.long, device="cuda")
 
     def training_setup(self, training_args: OptimizationParams) -> None:
         self._init_gradient_accumulators()
@@ -467,6 +535,8 @@ class GaussianModel:
             l.append("sg_color_{}".format(i))
         if not exclude_filter:
             l.append("filter_3D")
+        l.append("instance_id")
+        l.append("semantic_category")
         return l
 
     def save_ply(self, path):
@@ -484,13 +554,44 @@ class GaussianModel:
         sg_color = self._sg_color.detach().flatten(start_dim=1).contiguous().cpu().numpy()
 
         filter_3D = self.filter_3D.detach().cpu().numpy()
-        dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
+        instance_id = self._instance_id.detach().cpu().numpy().astype(np.float32).reshape(-1, 1)
+        semantic_category = self._semantic_category.detach().cpu().numpy().astype(np.float32).reshape(-1, 1)
+
+        attr_list = self.construct_list_of_attributes()
+        dtype_full = [(attribute, "f4") for attribute in attr_list]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D, instance_id, semantic_category), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
+
+    def save_segments_json(self, ply_path, category_names, category_colors):
+        """Write segments.json alongside the PLY file with category metadata."""
+        import json
+
+        seg_path = os.path.join(os.path.dirname(ply_path), "segments.json")
+        cats = self._semantic_category.detach().cpu()
+        inst = self._instance_id.detach().cpu()
+
+        categories = []
+        for cat_id, name in enumerate(category_names):
+            cat_mask = cats == cat_id
+            n_gaussians = int(cat_mask.sum().item())
+            n_instances = int(inst[cat_mask].unique().numel()) if n_gaussians > 0 else 0
+            color = category_colors[cat_id] if cat_id < len(category_colors) else [128, 128, 128]
+            categories.append({
+                "id": cat_id,
+                "name": name,
+                "color": color,
+                "n_gaussians": n_gaussians,
+                "n_instances": n_instances,
+            })
+
+        data = {"categories": categories}
+        with open(seg_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Segments metadata saved to {seg_path}")
 
     @torch.no_grad()
     def get_tetra_points(self):
@@ -607,6 +708,21 @@ class GaussianModel:
         self._sg_color = nn.Parameter(torch.tensor(sg_color, dtype=torch.float, device="cuda").requires_grad_(True))
         self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device="cuda")
 
+        # Load instance_id if present in PLY, else default to 0
+        prop_names = [p.name for p in plydata.elements[0].properties]
+        if "instance_id" in prop_names:
+            inst = np.asarray(plydata.elements[0]["instance_id"]).astype(np.int64)
+            self._instance_id = torch.tensor(inst, dtype=torch.long, device="cuda")
+        else:
+            self._instance_id = torch.zeros(xyz.shape[0], dtype=torch.long, device="cuda")
+        self._instance_entropy = torch.zeros(xyz.shape[0], device="cuda")
+
+        if "semantic_category" in prop_names:
+            sem = np.asarray(plydata.elements[0]["semantic_category"]).astype(np.int64)
+            self._semantic_category = torch.tensor(sem, dtype=torch.long, device="cuda")
+        else:
+            self._semantic_category = torch.zeros(xyz.shape[0], dtype=torch.long, device="cuda")
+
         self.active_sh_degree = self.max_sh_degree
         self.active_sg_degree = self.max_sg_degree
 
@@ -632,6 +748,8 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] in ["appearance_embeddings", "appearance_network"]:
                 continue
+            if hasattr(self, "shoptimizer") and self.shoptimizer is not None and group["name"] == "f_rest":
+                continue
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -651,9 +769,15 @@ class GaussianModel:
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
+        if hasattr(self, "shoptimizer") and self.shoptimizer is not None:
+            # f_rest is managed by shoptimizer, not main optimizer
+            self._prune_shoptimizer(valid_points_mask)
+            self._features_rest = self.shoptimizer.param_groups[0]["params"][0]
+        else:
+            self._features_rest = optimizable_tensors["f_rest"]
+
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -665,6 +789,11 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self._instance_id.numel() > 0:
+            self._instance_id = self._instance_id[valid_points_mask]
+            self._instance_entropy = self._instance_entropy[valid_points_mask]
+        if self._semantic_category.numel() > 0:
+            self._semantic_category = self._semantic_category[valid_points_mask]
 
     def prune_points_inference(self, mask):
         valid_points_mask = ~mask
@@ -679,11 +808,18 @@ class GaussianModel:
         self._sg_sharpness = self._sg_sharpness[valid_points_mask]
         self._sg_color = self._sg_color[valid_points_mask]
         self.filter_3D = self.filter_3D[valid_points_mask]
+        if self._instance_id.numel() > 0:
+            self._instance_id = self._instance_id[valid_points_mask]
+            self._instance_entropy = self._instance_entropy[valid_points_mask]
+        if self._semantic_category.numel() > 0:
+            self._semantic_category = self._semantic_category[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] in ["appearance_embeddings", "appearance_network"]:
+                continue
+            if group["name"] not in tensors_dict:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -717,11 +853,19 @@ class GaussianModel:
             "sg_sharpness": new_sg_sharpness,
             "sg_color": new_sg_color,
         }
-        # extension_num = new_xyz.shape[0]
-        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+
+        if hasattr(self, "shoptimizer") and self.shoptimizer is not None:
+            # f_rest is managed by shoptimizer, handle separately
+            d_no_frest = {k: v for k, v in d.items() if k != "f_rest"}
+            optimizable_tensors = self.cat_tensors_to_optimizer(d_no_frest)
+            self._cat_tensors_to_shoptimizer(new_features_rest)
+            self._features_rest = self.shoptimizer.param_groups[0]["params"][0]
+        else:
+            optimizable_tensors = self.cat_tensors_to_optimizer(d)
+            self._features_rest = optimizable_tensors["f_rest"]
+
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -733,6 +877,16 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        N_new = self.get_xyz.shape[0]
+        N_old = self._instance_id.shape[0] if self._instance_id.numel() > 0 else 0
+        if N_new > N_old:
+            pad = N_new - N_old
+            self._instance_id = torch.cat([self._instance_id, torch.zeros(pad, dtype=torch.long, device="cuda")])
+            self._instance_entropy = torch.cat([self._instance_entropy, torch.zeros(pad, device="cuda")])
+        N_old_sem = self._semantic_category.shape[0] if self._semantic_category.numel() > 0 else 0
+        if N_new > N_old_sem:
+            pad_sem = N_new - N_old_sem
+            self._semantic_category = torch.cat([self._semantic_category, torch.zeros(pad_sem, dtype=torch.long, device="cuda")])
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -814,6 +968,317 @@ class GaussianModel:
         self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
         return clone - before, split - clone, split - prune
+
+    # ======================== Instance-aware densification ==================
+
+    @torch.no_grad()
+    def densify_and_prune_instance(
+        self,
+        W_sparse: dict[int, dict[int, float]],
+        tau_split: float = 0.5,
+        tau_prune: float = 0.1,
+    ) -> tuple[int, int]:
+        """Stage C: entropy-based instance-aware split and prune.
+
+        - High entropy (H > tau_split) Gaussians are split along their
+          smallest scale axis, with the two children assigned the top-2 labels.
+        - Gaussians whose max weight is below tau_prune are pruned.
+
+        Returns (n_split, n_pruned).
+        """
+        N = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        entropy = torch.zeros(N, device=device)
+        max_weight = torch.zeros(N, device=device)
+
+        for prim_id, label_weights in W_sparse.items():
+            if prim_id >= N:
+                continue
+            vals = torch.tensor(list(label_weights.values()), device=device)
+            total = vals.sum()
+            if total > 0:
+                p = vals / total
+                h = -(p * (p + 1e-10).log()).sum()
+                entropy[prim_id] = h
+                max_weight[prim_id] = vals.max()
+            else:
+                max_weight[prim_id] = 0.0
+
+        self._instance_entropy = entropy
+
+        # Prune low-confidence Gaussians
+        prune_mask = (max_weight > 0) & (max_weight < tau_prune)
+        n_pruned = prune_mask.sum().item()
+        if n_pruned > 0:
+            self.prune_points(prune_mask)
+            # After pruning, W_sparse indices are stale — caller should
+            # rebuild if needed.
+
+        # Split high-entropy Gaussians
+        split_mask = entropy[:self.get_xyz.shape[0]] > tau_split
+        n_split = split_mask.sum().item()
+        if n_split > 0:
+            # Assign top-2 labels to the split children
+            top2_labels = torch.zeros(n_split, 2, dtype=torch.long, device=device)
+            split_indices = torch.where(split_mask)[0]
+            for i, pidx in enumerate(split_indices.cpu().tolist()):
+                if pidx in W_sparse:
+                    sorted_labels = sorted(W_sparse[pidx].items(), key=lambda x: -x[1])
+                    top2_labels[i, 0] = sorted_labels[0][0] if len(sorted_labels) > 0 else 0
+                    top2_labels[i, 1] = sorted_labels[1][0] if len(sorted_labels) > 1 else top2_labels[i, 0]
+
+            # Create split children (2 copies, offset along smallest scale axis)
+            stds = self.get_scaling[split_mask].repeat(2, 1)
+            means = torch.zeros((stds.size(0), 3), device=device)
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(self._rotation[split_mask]).repeat(2, 1, 1)
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[split_mask].repeat(2, 1)
+            new_scaling = self.scaling_inverse_activation(self.get_scaling[split_mask].repeat(2, 1) / 1.6)
+            new_rotation = self._rotation[split_mask].repeat(2, 1)
+            new_features_dc = self._features_dc[split_mask].repeat(2, 1, 1)
+            new_features_rest = self._features_rest[split_mask].repeat(2, 1, 1)
+            new_opacities = self._opacity[split_mask].repeat(2, 1)
+            new_sg_axis = self._sg_axis[split_mask].repeat(2, 1, 1)
+            new_sg_sharpness = self._sg_sharpness[split_mask].repeat(2, 1)
+            new_sg_color = self._sg_color[split_mask].repeat(2, 1, 1)
+
+            self.densification_postfix(
+                new_xyz, new_features_dc, new_features_rest, new_opacities,
+                new_scaling, new_rotation, new_sg_axis, new_sg_sharpness, new_sg_color,
+            )
+
+            # Assign top-2 labels to new children
+            N_after = self.get_xyz.shape[0]
+            child_start = N_after - 2 * n_split
+            self._instance_id[child_start : child_start + n_split] = top2_labels[:, 0]
+            self._instance_id[child_start + n_split :] = top2_labels[:, 1]
+
+            # Prune the original split parents
+            prune_filter = torch.cat([split_mask, torch.zeros(2 * n_split, device=device, dtype=bool)])
+            self.prune_points(prune_filter)
+
+        return n_split, n_pruned
+
+    # ======================== FastGS VCD/VCP methods ========================
+
+    def densify_and_clone_fastgs(self, metric_mask, all_clones):
+        """FastGS: clone small Gaussians that pass both gradient AND multi-view filter."""
+        selected_pts_mask = torch.logical_and(metric_mask, all_clones)
+
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+        new_sg_axis = self._sg_axis[selected_pts_mask]
+        new_sg_sharpness = self._sg_sharpness[selected_pts_mask]
+        new_sg_color = self._sg_color[selected_pts_mask]
+
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacities,
+            new_scaling, new_rotation, new_sg_axis, new_sg_sharpness, new_sg_color,
+        )
+
+    def densify_and_split_fastgs(self, metric_mask, all_splits, N=2):
+        """FastGS: split large Gaussians that pass abs-gradient AND multi-view filter."""
+        n_init_points = self.get_xyz.shape[0]
+
+        selected_pts_mask = torch.zeros((n_init_points), dtype=bool, device="cuda")
+        mask = torch.logical_and(metric_mask, all_splits)
+        selected_pts_mask[: mask.shape[0]] = mask
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacities = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_sg_axis = self._sg_axis[selected_pts_mask].repeat(N, 1, 1)
+        new_sg_sharpness = self._sg_sharpness[selected_pts_mask].repeat(N, 1)
+        new_sg_color = self._sg_color[selected_pts_mask].repeat(N, 1, 1)
+
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacities,
+            new_scaling, new_rotation, new_sg_axis, new_sg_sharpness, new_sg_color,
+        )
+
+        prune_filter = torch.cat(
+            (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool))
+        )
+        self.prune_points(prune_filter)
+
+    def densify_and_prune_fastgs(self, max_screen_size, min_opacity, extent, radii, args, importance_score=None, pruning_score=None):
+        """FastGS densification pipeline: gradient + multi-view filter -> clone/split -> prune -> reset opacity."""
+        grad_vars = self.xyz_gradient_accum / self.denom
+        grad_vars[grad_vars.isnan()] = 0.0
+
+        grads_abs = self.xyz_gradient_accum_abs / self.denom
+        grads_abs[grads_abs.isnan()] = 0.0
+
+        grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= args.grad_thresh, True, False)
+        grad_qualifiers_abs = torch.where(torch.norm(grads_abs, dim=-1) >= args.grad_abs_thresh, True, False)
+        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.dense * extent
+        split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.dense * extent
+
+        all_clones = torch.logical_and(clone_qualifiers, grad_qualifiers)
+        all_splits = torch.logical_and(split_qualifiers, grad_qualifiers_abs)
+
+        # Multi-view consistent metric mask for densification
+        metric_mask = importance_score > 5
+
+        self.densify_and_clone_fastgs(metric_mask, all_clones)
+        self.densify_and_split_fastgs(metric_mask, all_splits)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # Budget-based pruning weighted by pruning_score
+        scores = 1 - pruning_score
+        to_remove = torch.sum(prune_mask)
+        remove_budget = int(0.5 * to_remove)
+
+        if remove_budget:
+            n_init_points = self.get_xyz.shape[0]
+            padded_importance = torch.zeros((n_init_points), dtype=torch.float32)
+            padded_importance[: scores.shape[0]] = 1 / (1e-6 + scores.squeeze())
+            selected_pts_mask = torch.zeros_like(padded_importance, dtype=bool, device="cuda")
+            sampled_indices = torch.multinomial(padded_importance, remove_budget, replacement=False)
+            selected_pts_mask[sampled_indices] = True
+            final_prune = torch.logical_and(prune_mask, selected_pts_mask)
+            self.prune_points(final_prune)
+
+        # Reset opacity: clamp to max 0.8 (FastGS approach).
+        # 3D filter correction is deferred — filter is recomputed in train.py
+        # right after this call, so applying correction here with stale filter
+        # would cause size mismatches.
+        opacities_new = self.inverse_opacity_activation(
+            torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.8)
+        )
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+
+        torch.cuda.empty_cache()
+
+    def final_prune_fastgs(self, min_opacity=0.1, pruning_score=None):
+        """VCP: final-stage pruning by opacity and multi-view consistency."""
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if pruning_score is not None:
+            scores_mask = pruning_score > 0.9
+            prune_mask = torch.logical_or(prune_mask, scores_mask)
+        self.prune_points(prune_mask)
+
+    # ======================== FastGS shoptimizer ========================
+
+    def training_setup_fastgs(self, training_args):
+        """Setup with separate SH optimizer (shoptimizer) for FastGS."""
+        self._init_gradient_accumulators()
+
+        # Build base param groups WITHOUT f_rest
+        self.xyz_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
+            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
+            lr_delay_mult=training_args.position_lr_delay_mult,
+            max_steps=training_args.position_lr_max_steps,
+        )
+        spatial_lr = training_args.position_lr_init * self.spatial_lr_scale
+        base_param_groups = [
+            {"params": [self._xyz], "lr": spatial_lr, "name": "xyz"},
+            {"params": [self._features_dc], "lr": training_args.feature_dc_lr, "name": "f_dc"},
+            {"params": [self._opacity], "lr": training_args.opacity_lr, "name": "opacity"},
+            {"params": [self._scaling], "lr": training_args.scaling_lr, "name": "scaling"},
+            {"params": [self._rotation], "lr": training_args.rotation_lr, "name": "rotation"},
+            {"params": [self._sg_axis], "lr": training_args.sg_axis_lr, "name": "sg_axis"},
+            {"params": [self._sg_sharpness], "lr": training_args.sg_sharpness_lr, "name": "sg_sharpness"},
+            {"params": [self._sg_color], "lr": training_args.sg_color, "name": "sg_color"},
+        ]
+
+        appearance_groups = self._build_appearance_param_groups(training_args)
+
+        self.optimizer = torch.optim.Adam(
+            base_param_groups + appearance_groups,
+            lr=0.0,
+            eps=1e-15,
+        )
+
+        # Separate SH rest optimizer
+        self.shoptimizer = torch.optim.Adam(
+            [{"params": [self._features_rest], "lr": training_args.highfeature_lr / 20.0, "name": "f_rest"}],
+            lr=0.0,
+            eps=1e-15,
+        )
+
+    def optimizer_step(self, iteration):
+        """FastGS scheduled optimizer stepping.
+        0-15k:   main optimizer every iter, shoptimizer every 16 iters
+        15k-20k: both every 32 iters
+        20k+:    both every 64 iters
+        """
+        if iteration <= 15000:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            if iteration % 16 == 0:
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
+        elif iteration <= 20000:
+            if iteration % 32 == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
+        else:
+            if iteration % 64 == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.shoptimizer.step()
+                self.shoptimizer.zero_grad(set_to_none=True)
+
+    def _prune_shoptimizer(self, mask):
+        """Prune the shoptimizer state for f_rest."""
+        if self.shoptimizer is None:
+            return
+        for group in self.shoptimizer.param_groups:
+            stored_state = self.shoptimizer.state.get(group["params"][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                del self.shoptimizer.state[group["params"][0]]
+                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                self.shoptimizer.state[group["params"][0]] = stored_state
+            else:
+                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+
+    def _cat_tensors_to_shoptimizer(self, extension_tensor):
+        """Extend the shoptimizer state for f_rest."""
+        if self.shoptimizer is None:
+            return
+        for group in self.shoptimizer.param_groups:
+            stored_state = self.shoptimizer.state.get(group["params"][0], None)
+            if stored_state is not None:
+                stored_state["exp_avg"] = torch.cat(
+                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                stored_state["exp_avg_sq"] = torch.cat(
+                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0
+                )
+                del self.shoptimizer.state[group["params"][0]]
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                )
+                self.shoptimizer.state[group["params"][0]] = stored_state
+            else:
+                group["params"][0] = nn.Parameter(
+                    torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                )
+
+    # ======================== end FastGS ========================
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)

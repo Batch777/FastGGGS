@@ -67,42 +67,31 @@ __global__ void checkFrustum(int P,
 
 // Generates one key/value pair for all Gaussian / tile overlaps.
 // Run once per Gaussian (1:N mapping).
+// Uses SNUGBOX (compact bounding box) for tight ellipse-based tile iteration.
 __global__ void duplicateWithKeys(
     int P,
+    const float mult,
     const float2* points_xy,
     const float* depths,
     const uint32_t* offsets,
     uint64_t* gaussian_keys_unsorted,
     uint32_t* gaussian_values_unsorted,
-    int* radii,
+    const float4* conic_opacity,
+    const uint32_t* tiles_touched,
     dim3 grid) {
     auto idx = cg::this_grid().thread_rank();
     if (idx >= P)
         return;
 
     // Generate no key/value pair for invisible Gaussians
-    if (radii[idx] > 0) {
+    if (tiles_touched[idx] > 0) {
         // Find this Gaussian's offset in buffer for writing keys/values.
         uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-        uint2 rect_min, rect_max;
-
-        getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
-
-        // For each tile that the bounding rect overlaps, emit a
-        // key/value pair. The key is |  tile ID  |      depth      |,
-        // and the value is the ID of the Gaussian. Sorting the values
-        // with this key yields Gaussian IDs in a list, such that they
-        // are first sorted by tile and then by depth.
-        for (int y = rect_min.y; y < rect_max.y; y++) {
-            for (int x = rect_min.x; x < rect_max.x; x++) {
-                uint64_t key = y * grid.x + x;
-                key <<= 32;
-                key |= *((uint32_t*)&depths[idx]);
-                gaussian_keys_unsorted[off]   = key;
-                gaussian_values_unsorted[off] = idx;
-                off++;
-            }
-        }
+        duplicateToTilesTouched(
+            points_xy[idx], conic_opacity[idx], grid, mult,
+            idx, off, depths[idx],
+            gaussian_keys_unsorted,
+            gaussian_values_unsorted);
     }
 }
 
@@ -314,7 +303,11 @@ int CudaRasterizer::Rasterizer::forward(
     float* out_normal,
     int* radii,
     bool require_depth,
-    bool debug) {
+    bool debug,
+    bool get_flag,
+    const int* metric_map,
+    int* metricCount,
+    float mult) {
     const float focal_y = height / (2.0f * tan_fovy);
     const float focal_x = width / (2.0f * tan_fovx);
 
@@ -363,6 +356,7 @@ int CudaRasterizer::Rasterizer::forward(
                    focal_x, focal_y,
                    tan_fovx, tan_fovy,
                    kernel_size,
+                   mult,
                    radii,
                    geomState.clamped,
                    geomState.means2D,
@@ -390,13 +384,14 @@ int CudaRasterizer::Rasterizer::forward(
     // For each instance to be rendered, produce adequate [ tile | depth ] key
     // and corresponding dublicated Gaussian indices to be sorted
     duplicateWithKeys<<<(P + 255) / 256, 256>>>(
-        P,
+        P, mult,
         geomState.means2D,
         geomState.depths,
         geomState.point_offsets,
         binningState.point_list_keys_unsorted,
         binningState.point_list_unsorted,
-        radii,
+        geomState.conic_opacity,
+        geomState.tiles_touched,
         tile_grid);
     CHECK_CUDA(, debug);
 
@@ -442,7 +437,10 @@ int CudaRasterizer::Rasterizer::forward(
                    out_normal,
                    out_mdepth,
                    imgState.normal_length,
-                   require_depth),
+                   require_depth,
+                   get_flag,
+                   metric_map,
+                   metricCount),
                debug);
     return num_rendered;
 }
@@ -653,6 +651,7 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
                    focal_x, focal_y,
                    tan_fovx, tan_fovy,
                    kernel_size,
+                   1.0f,
                    geomState.internal_radii,
                    geomState.clamped,
                    geomState.means2D,
@@ -682,15 +681,16 @@ int CudaRasterizer::Rasterizer::evaluateTransmittance(
     // For each instance to be rendered, produce adequate [ tile | depth ] key
     // and corresponding dublicated Gaussian indices to be sorted
     duplicateWithKeys<<<(P + 255) / 256, 256>>>(
-        P,
+        P, 1.0f,
         geomState.means2D,
         geomState.depths,
         geomState.point_offsets,
         binningState.point_list_keys_unsorted,
         binningState.point_list_unsorted,
-        geomState.internal_radii,
-        tile_grid)
-        CHECK_CUDA(, debug);
+        geomState.conic_opacity,
+        geomState.tiles_touched,
+        tile_grid);
+    CHECK_CUDA(, debug);
 
     int bit = getHigherMsb(tiles);
 
@@ -878,6 +878,7 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
                    focal_x, focal_y,
                    tan_fovx, tan_fovy,
                    kernel_size,
+                   1.0f,
                    geomState.internal_radii,
                    geomState.clamped,
                    geomState.means2D,
@@ -907,15 +908,16 @@ int CudaRasterizer::Rasterizer::evaluateSDF(
     // For each instance to be rendered, produce adequate [ tile | depth ] key
     // and corresponding dublicated Gaussian indices to be sorted
     duplicateWithKeys<<<(P + 255) / 256, 256>>>(
-        P,
+        P, 1.0f,
         geomState.means2D,
         geomState.depths,
         geomState.point_offsets,
         binningState.point_list_keys_unsorted,
         binningState.point_list_unsorted,
-        geomState.internal_radii,
-        tile_grid)
-        CHECK_CUDA(, debug);
+        geomState.conic_opacity,
+        geomState.tiles_touched,
+        tile_grid);
+    CHECK_CUDA(, debug);
 
     int bit = getHigherMsb(tiles);
 
@@ -1099,6 +1101,7 @@ int3 CudaRasterizer::Rasterizer::sampleDepth(
                    focal_x, focal_y,
                    tan_fovx, tan_fovy,
                    kernel_size,
+                   1.0f,
                    geomState.internal_radii,
                    geomState.clamped,
                    geomState.means2D,
@@ -1126,13 +1129,14 @@ int3 CudaRasterizer::Rasterizer::sampleDepth(
     // For each instance to be rendered, produce adequate [ tile | depth ] key
     // and corresponding dublicated Gaussian indices to be sorted
     duplicateWithKeys<<<(P + 255) / 256, 256>>>(
-        P,
+        P, 1.0f,
         geomState.means2D,
         geomState.depths,
         geomState.point_offsets,
         binningState.point_list_keys_unsorted,
         binningState.point_list_unsorted,
-        geomState.internal_radii,
+        geomState.conic_opacity,
+        geomState.tiles_touched,
         tile_grid);
     CHECK_CUDA(, debug);
 

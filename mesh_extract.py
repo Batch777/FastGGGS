@@ -37,9 +37,9 @@ def post_process_mesh(mesh, cluster_to_keep=1):
     return mesh_0
 
 
-def extract_mesh(dataset, pipe, iteration, num_cluster=1):
+def extract_mesh(dataset, pipe, iteration, num_cluster=1, voxel_size=0.002, depth_max=8.0, block_count=50000):
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
-    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, load_images=False)
 
     kernel_size = dataset.kernel_size
 
@@ -47,20 +47,7 @@ def extract_mesh(dataset, pipe, iteration, num_cluster=1):
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     viewpoint_cam_list = scene.getTrainCameras()
 
-    depth_list = []
-    color_list = []
-    for viewpoint_cam in viewpoint_cam_list:
-        # Rendering offscreen from that camera
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size)
-        rendered_img = torch.clamp(render_pkg["render"], min=0, max=1.0).cpu().numpy().transpose(1, 2, 0)
-        color_list.append(np.ascontiguousarray(rendered_img))
-        depth = render_pkg["median_depth"].clone()
-        if viewpoint_cam.gt_mask is not None:
-            depth[(viewpoint_cam.gt_mask < 0.5)] = 0
-        depth_list.append(depth[0].cpu().numpy())
-
-    torch.cuda.empty_cache()
-    voxel_size = 0.002
+    print(f"TSDF params: voxel_size={voxel_size}, depth_max={depth_max}, block_count={block_count}")
     o3d_device = o3d.core.Device("CPU:0")
     vbg = o3d.t.geometry.VoxelBlockGrid(
         attr_names=("tsdf", "weight", "color"),
@@ -68,20 +55,36 @@ def extract_mesh(dataset, pipe, iteration, num_cluster=1):
         attr_channels=((1), (1), (3)),
         voxel_size=voxel_size,
         block_resolution=16,
-        block_count=50000,
+        block_count=block_count,
         device=o3d_device,
     )
-    for color, depth, viewpoint_cam in zip(color_list, depth_list, viewpoint_cam_list):
-        depth = o3d.t.geometry.Image(depth)
-        depth = depth.to(o3d_device)
-        color = o3d.t.geometry.Image(color)
-        color = color.to(o3d_device)
-        intrinsic = np.array([[viewpoint_cam.Fx, 0, viewpoint_cam.Cx], [0, viewpoint_cam.Fy, viewpoint_cam.Cy], [0, 0, 1]], dtype=np.float64)
-        intrinsic = o3d.core.Tensor(intrinsic)
-        extrinsic = o3d.core.Tensor((viewpoint_cam.world_view_transform.T).cpu().numpy().astype(np.float64))
-        frustum_block_coords = vbg.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, 8.0)
-        vbg.integrate(frustum_block_coords, depth, color, intrinsic, extrinsic, 1.0, 8.0)
+    n_cams = len(viewpoint_cam_list)
+    for i, viewpoint_cam in enumerate(viewpoint_cam_list):
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size)
+        color = torch.clamp(render_pkg["render"], min=0, max=1.0).cpu().numpy().transpose(1, 2, 0)
+        color = np.ascontiguousarray(color)
+        depth = render_pkg["median_depth"].clone()
+        if viewpoint_cam.gt_mask is not None:
+            depth[(viewpoint_cam.gt_mask < 0.5)] = 0
+        depth = depth[0].cpu().numpy()
+        del render_pkg; torch.cuda.empty_cache()
 
+        depth_img = o3d.t.geometry.Image(depth).to(o3d_device)
+        color_img = o3d.t.geometry.Image(color).to(o3d_device)
+        intrinsic = o3d.core.Tensor(np.array(
+            [[viewpoint_cam.Fx, 0, viewpoint_cam.Cx],
+             [0, viewpoint_cam.Fy, viewpoint_cam.Cy],
+             [0, 0, 1]], dtype=np.float64))
+        extrinsic = o3d.core.Tensor(
+            (viewpoint_cam.world_view_transform.T).cpu().numpy().astype(np.float64))
+        frustum_block_coords = vbg.compute_unique_block_coordinates(
+            depth_img, intrinsic, extrinsic, 1.0, depth_max)
+        vbg.integrate(frustum_block_coords, depth_img, color_img,
+                      intrinsic, extrinsic, 1.0, depth_max)
+        if (i + 1) % 50 == 0 or i == 0:
+            print(f"  Integrated {i+1}/{n_cams}")
+
+    print(f"Active blocks: {vbg.hashmap().size()}/{block_count}")
     mesh = vbg.extract_triangle_mesh()
     mesh.compute_vertex_normals()
     o3d.io.write_triangle_mesh(os.path.join(dataset.model_path, "recon.ply"), mesh.to_legacy())
@@ -96,10 +99,14 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--num_cluster", default=1, type=int)
+    parser.add_argument("--voxel_size", default=0.002, type=float)
+    parser.add_argument("--depth_max", default=8.0, type=float)
+    parser.add_argument("--block_count", default=50000, type=int)
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
-    
+
     # Initialize system state (RNG)
     safe_state(args.quiet)
     with torch.no_grad():
-        extract_mesh(model.extract(args), pipeline.extract(args), args.iteration, args.num_cluster)
+        extract_mesh(model.extract(args), pipeline.extract(args), args.iteration, args.num_cluster,
+                     voxel_size=args.voxel_size, depth_max=args.depth_max, block_count=args.block_count)

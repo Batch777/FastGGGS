@@ -31,11 +31,18 @@ except ImportError:
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import network_gui, render
 from scene import GaussianModel, Scene
+from utils.fast_utils import sampling_cameras, compute_gaussian_score_fastgs
 from scene.cameras import Camera
 from utils.general_utils import safe_state
 from utils.graphics_utils import depth_to_normal
 from utils.image_utils import psnr
 from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
+from utils.instance_utils import (
+    assign_instance_labels,
+    instance_seg_loss_ce,
+    instance_seg_loss_contrastive,
+    depth_edge_loss,
+)
 
 
 def training(
@@ -52,7 +59,10 @@ def training(
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
     scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
+    if opt.use_fastgs:
+        gaussians.training_setup_fastgs(opt)
+    else:
+        gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -78,6 +88,9 @@ def training(
             debug=True,
             model_path=dataset.model_path,
         )
+
+    # Instance segmentation state
+    ema_inst_loss_for_log = 0.0
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -176,6 +189,18 @@ def training(
         rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
 
         loss = rgb_loss + opt.lambda_depth_normal * depth_normal_loss + opt.lambda_multi_view_ncc * ncc_loss + opt.lambda_multi_view_geo * geo_loss
+
+        # Instance segmentation loss
+        if opt.use_instance_seg and iteration >= opt.instance_seg_from_iter:
+            if opt.seg_loss_mode == "ce":
+                loss_seg = instance_seg_loss_ce(viewpoint_cam, gaussians, render_pkg)
+            else:
+                loss_seg = instance_seg_loss_contrastive(viewpoint_cam, gaussians, render_pkg)
+            loss_de = depth_edge_loss(render_pkg, viewpoint_cam) if reg_kick_on else torch.tensor(0.0, device="cuda")
+            loss = loss + opt.lambda_seg * loss_seg + opt.lambda_depth_edge * loss_de
+        else:
+            loss_seg = torch.tensor(0.0, device="cuda")
+
         loss.backward()
 
         iter_end.record()
@@ -185,15 +210,18 @@ def training(
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_normal_loss_for_log = 0.4 * depth_normal_loss.item() + 0.6 * ema_normal_loss_for_log
             ema_ncc_loss_for_log = 0.4 * ncc_loss.item() + 0.6 * ema_ncc_loss_for_log
+            if opt.use_instance_seg:
+                ema_inst_loss_for_log = 0.4 * loss_seg.item() + 0.6 * ema_inst_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix(
-                    {
-                        "Loss": f"{ema_loss_for_log:.{4}f}",
-                        "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
-                        "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
-                    }
-                )
+                postfix = {
+                    "Loss": f"{ema_loss_for_log:.{4}f}",
+                    "loss_normal": f"{ema_normal_loss_for_log:.{4}f}",
+                    "loss_ncc": f"{ema_ncc_loss_for_log:.{4}f}",
+                }
+                if opt.use_instance_seg:
+                    postfix["loss_inst"] = f"{ema_inst_loss_for_log:.{4}f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -218,26 +246,70 @@ def training(
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            if opt.use_fastgs:
+                # FastGS: View-Consistent Densification (VCD)
+                if iteration < opt.densify_until_iter:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(
-                        opt.densify_grad_threshold,
-                        0.05,
-                        scene.cameras_extent,
-                        size_threshold,
-                    )
-                    if dataset.disable_filter3D:
-                        gaussians.reset_3D_filter()
-                    else:
-                        gaussians.compute_3D_filter(cameras=trainCameras)
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        camlist = sampling_cameras(scene.getTrainCameras().copy())
+                        importance_score, pruning_score = compute_gaussian_score_fastgs(
+                            camlist, gaussians, pipe, background, opt, kernel_size, DENSIFY=True)
+                        gaussians.densify_and_prune_fastgs(
+                            max_screen_size=size_threshold,
+                            min_opacity=0.005,
+                            extent=scene.cameras_extent,
+                            radii=radii,
+                            args=opt,
+                            importance_score=importance_score,
+                            pruning_score=pruning_score)
+                        if dataset.disable_filter3D:
+                            gaussians.reset_3D_filter()
+                        else:
+                            gaussians.compute_3D_filter(cameras=trainCameras)
 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
+
+                # FastGS: View-Consistent Pruning (VCP)
+                if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+                    camlist = sampling_cameras(scene.getTrainCameras().copy())
+                    _, pruning_score = compute_gaussian_score_fastgs(
+                        camlist, gaussians, pipe, background, opt, kernel_size)
+                    gaussians.final_prune_fastgs(min_opacity=0.1, pruning_score=pruning_score)
+            else:
+                # Original GGGS densification
+                if iteration < opt.densify_until_iter:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold,
+                            0.05,
+                            scene.cameras_extent,
+                            size_threshold,
+                        )
+                        if dataset.disable_filter3D:
+                            gaussians.reset_3D_filter()
+                        else:
+                            gaussians.compute_3D_filter(cameras=trainCameras)
+
+                    if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
+
+            # Periodic instance segmentation update
+            if (opt.use_instance_seg
+                and iteration >= opt.instance_seg_from_iter
+                and iteration % opt.instance_update_interval == 0):
+                assign_instance_labels(
+                    trainCameras, gaussians,
+                    tau_aff=opt.tau_affinity,
+                    max_cameras=150,
+                )
 
             if iteration % 100 == 0 and iteration > opt.densify_until_iter and not dataset.disable_filter3D:
                 if iteration < opt.iterations - 100:
@@ -246,8 +318,11 @@ def training(
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
+                if opt.use_fastgs:
+                    gaussians.optimizer_step(iteration)
+                else:
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none=True)
 
             if iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
